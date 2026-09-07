@@ -31,5 +31,5 @@ Open the file directly in a browser, or serve the folder:
 python3 -m http.server 8000
 ```
 
-Two resources load from a CDN: Google Fonts, and `html2pdf.js` for the PDF export.
+Three resources load from a CDN: Google Fonts, plus `html2canvas` and `jsPDF` for the PDF export.
 Everything else, including all state, is local. If the PDF library cannot load, the download falls back to the browser print dialog, where "Save as PDF" produces the same page.

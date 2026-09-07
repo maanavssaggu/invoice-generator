@@ -49,6 +49,10 @@
   --step-2: 20px;
   --step-3: 27px;
 
+  /* Design width of the invoice. 800px maps to the 190mm printable width of
+     an A4 page with 10mm margins, so preview and PDF are the same geometry. */
+  --doc-w: 800px;
+
   --ui: "Public Sans", ui-sans-serif, system-ui, "Helvetica Neue", Arial, sans-serif;
   --display: "Archivo", "Public Sans", ui-sans-serif, system-ui, Arial, sans-serif;
   --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -530,7 +534,7 @@ button.ghost:disabled:hover { background: transparent; color: var(--ink); }
 }
 
 #doc-scale {
-  width: 800px;
+  width: var(--doc-w);
   transform-origin: top left;
 }
 
@@ -538,8 +542,8 @@ button.ghost:disabled:hover { background: transparent; color: var(--ink); }
    THE INVOICE DOCUMENT (always light: it is paper)
    ============================================================ */
 .invoice {
-  width: 800px;
-  min-height: 1150px;
+  width: var(--doc-w);
+  min-height: 1160px;
   display: flex;
   flex-direction: column;
   background: #ffffff;
@@ -664,7 +668,7 @@ body.exporting #toast { display: none !important; }
 body.exporting .app { max-width: none; padding: 0; }
 body.exporting .workspace { display: block; gap: 0; }
 body.exporting .docpane { position: static; }
-body.exporting #doc-frame { width: 800px; height: auto !important; overflow: visible; }
+body.exporting #doc-frame { width: var(--doc-w); height: auto !important; overflow: visible; }
 body.exporting #doc-scale { transform: none !important; }
 body.exporting .invoice { border: none; box-shadow: none; }
 
@@ -1323,7 +1327,7 @@ body.exporting .invoice { border: none; box-shadow: none; }
     if (!frame || !scaler) return;
     var width = frame.clientWidth;
     if (!width) return;
-    var scale = Math.min(1, width / 800);
+    var scale = Math.min(1, width / $('invoice').offsetWidth);
     scaler.style.transform = 'scale(' + scale + ')';
     frame.style.height = ($('invoice').offsetHeight * scale) + 'px';
   }
@@ -1721,20 +1725,160 @@ body.exporting .invoice { border: none; box-shadow: none; }
 
   /* ==========================================================
      PDF
-     ========================================================== */
-  var pdfLoader = null;
 
-  function loadPdfLib() {
-    if (!pdfLoader) {
-      pdfLoader = new Promise(function (resolve, reject) {
-        var script = document.createElement('script');
-        script.src = 'https://cdn.jsdelivr.net/npm/html2pdf.js@0.10.2/dist/html2pdf.bundle.min.js';
-        script.onload = resolve;
-        script.onerror = function () { pdfLoader = null; reject(new Error('cdn')); };
-        document.head.appendChild(script);
+     html2canvas and jsPDF are driven directly rather than through
+     html2pdf, which clamps its clone container to the printable width
+     (190mm, about 718px) and clips any element wider than that. The
+     invoice is a fixed 800px, so it lost its right-hand column.
+     Rendering the canvas at the element's own width and slicing it into
+     pages here keeps the PDF identical to the preview.
+     ========================================================== */
+  var PAGE = { width: 210, height: 297, margin: 10 };
+  PAGE.innerW = PAGE.width - PAGE.margin * 2;
+  PAGE.innerH = PAGE.height - PAGE.margin * 2;
+
+  var LIBS = [
+    'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js'
+  ];
+
+  var libLoader = null;
+
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var script = document.createElement('script');
+      script.src = src;
+      script.onload = resolve;
+      script.onerror = function () { reject(new Error('cdn')); };
+      document.head.appendChild(script);
+    });
+  }
+
+  function loadPdfLibs() {
+    if (!libLoader) {
+      libLoader = Promise.all(LIBS.map(loadScript)).catch(function (err) {
+        libLoader = null;
+        throw err;
       });
     }
-    return pdfLoader;
+    return libLoader;
+  }
+
+  function jsPDFClass() {
+    return (window.jspdf && window.jspdf.jsPDF) || window.jsPDF;
+  }
+
+  /* Choose where a page break lands. Walking up from the hard boundary,
+     prefer a wide structural gap (above the totals or the payment block) so
+     a block moves as a whole; fall back to the narrower gap between table
+     rows; only cut blind if the canvas cannot be read or holds no gap. */
+  function blankCut(canvas, target, floorY) {
+    var start = Math.max(floorY, 0);
+    var height = target - start;
+    if (height <= 0) return target;
+
+    var data;
+    try {
+      data = canvas.getContext('2d').getImageData(0, start, canvas.width, height).data;
+    } catch (e) {
+      return target;
+    }
+
+    var blank = new Uint8Array(height);
+    for (var y = 0; y < height; y++) {
+      var isBlank = 1;
+      for (var x = 0; x < canvas.width; x += 4) {
+        var i = (y * canvas.width + x) * 4;
+        if (data[i] < 250 || data[i + 1] < 250 || data[i + 2] < 250) { isBlank = 0; break; }
+      }
+      blank[y] = isBlank;
+    }
+
+    // Canvas px at scale 2, so 60 is a 30px structural gap and 24 is the
+    // 12px breathing room between two table rows.
+    var bands = [60, 24];
+    for (var b = 0; b < bands.length; b++) {
+      var need = bands[b];
+      var run = 0;
+      for (var row = height - 1; row >= 0; row--) {
+        if (!blank[row]) { run = 0; continue; }
+        run++;
+        if (run >= need) return start + row + Math.floor(need / 2);
+      }
+    }
+    return target;
+  }
+
+  function renderPdf(el) {
+    var width = el.offsetWidth;
+    var height = el.offsetHeight;
+
+    return window.html2canvas(el, {
+      scale: 2,
+      useCORS: true,
+      backgroundColor: '#ffffff',
+      width: width,
+      height: height,
+      windowWidth: Math.max(width + 200, 1280),
+      windowHeight: Math.max(height + 200, 1024),
+      scrollX: 0,
+      scrollY: 0
+    }).then(function (canvas) {
+      var PDF = jsPDFClass();
+      var pdf = new PDF({ unit: 'mm', format: 'a4', orientation: 'portrait', compress: true });
+
+      // How many canvas pixels fit on one printable page at this width.
+      var pagePx = Math.floor(canvas.width * PAGE.innerH / PAGE.innerW);
+
+      // Within a small overflow, scale the whole invoice down to a single
+      // page. A second page carrying only the payment block reads as a
+      // mistake, and 12% smaller type is still crisp.
+      if (canvas.height <= pagePx * 1.12) {
+        var fitW = PAGE.innerW;
+        var fitH = canvas.height * PAGE.innerW / canvas.width;
+        if (fitH > PAGE.innerH) {
+          fitW = PAGE.innerW * (PAGE.innerH / fitH);
+          fitH = PAGE.innerH;
+        }
+        pdf.addImage(
+          canvas.toDataURL('image/jpeg', 0.98), 'JPEG',
+          PAGE.margin + (PAGE.innerW - fitW) / 2, PAGE.margin, fitW, fitH
+        );
+        return pdf;
+      }
+
+      var top = 0;
+      var first = true;
+
+      while (top < canvas.height) {
+        var target = Math.min(top + pagePx, canvas.height);
+        // Pull the cut up into blank space so a page never splits a table row
+        // or a totals line in half.
+        var bottom = target < canvas.height
+          ? blankCut(canvas, target, top + Math.floor(pagePx * 0.55))
+          : target;
+        var sliceH = bottom - top;
+        if (sliceH <= 0) break;
+
+        var slice = document.createElement('canvas');
+        slice.width = canvas.width;
+        slice.height = sliceH;
+        var ctx = slice.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, slice.width, slice.height);
+        ctx.drawImage(canvas, 0, top, canvas.width, sliceH, 0, 0, canvas.width, sliceH);
+
+        if (!first) pdf.addPage();
+        first = false;
+        pdf.addImage(
+          slice.toDataURL('image/jpeg', 0.98), 'JPEG',
+          PAGE.margin, PAGE.margin,
+          PAGE.innerW, sliceH * PAGE.innerW / canvas.width
+        );
+        top = bottom;
+      }
+      return pdf;
+    });
   }
 
   function pdfFilename() {
@@ -1751,34 +1895,31 @@ body.exporting .invoice { border: none; box-shadow: none; }
 
     var filename = pdfFilename();
     var scrollPos = window.scrollY;
-    var opts = {
-      margin: 10,
-      filename: filename,
-      image: { type: 'jpeg', quality: 0.98 },
-      html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff', scrollX: 0, scrollY: 0 },
-      jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
-      pagebreak: { mode: ['css', 'legacy'] }
-    };
+    var restored = false;
 
-    loadPdfLib().then(function () {
+    function restore() {
+      if (restored) return;
+      restored = true;
+      document.body.classList.remove('exporting');
+      window.scrollTo(0, scrollPos);
+      fitDoc();
+    }
+
+    loadPdfLibs().then(function () {
       document.body.classList.add('exporting');
       window.scrollTo(0, 0);
-      var worker = window.html2pdf().set(opts).from($('invoice'));
+      return renderPdf($('invoice'));
+    }).then(function (pdf) {
+      restore();
       if (state.downloads) {
-        return worker.outputPdf('blob').then(function (blob) {
-          document.body.classList.remove('exporting');
-          window.scrollTo(0, scrollPos);
-          return state.downloads.save({ filename: filename, data: blob });
-        }).then(function () {
-          recordInvoice();
-          toast('Invoice downloaded');
-        });
+        return state.downloads.save({ filename: filename, data: pdf.output('blob') })
+          .then(function () { recordInvoice(); toast('Invoice downloaded'); });
       }
-      return worker.save().then(function () {
-        recordInvoice();
-        toast('Invoice downloaded');
-      });
+      pdf.save(filename);
+      recordInvoice();
+      toast('Invoice downloaded');
     }).catch(function (err) {
+      restore();
       var code = err && err.code;
       if (code === 'declined') return;
       if (code === 'unavailable' || code === 'not_granted' || code === 'capability_disabled') {
@@ -1789,9 +1930,7 @@ body.exporting .invoice { border: none; box-shadow: none; }
       toast('Could not build the PDF, opening print', true);
       window.print();
     }).finally(function () {
-      document.body.classList.remove('exporting');
-      window.scrollTo(0, scrollPos);
-      fitDoc();
+      restore();
       btn.disabled = false;
       btn.textContent = label;
     });
